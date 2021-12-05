@@ -89,17 +89,33 @@ pub const constructors = struct {
     pub fn eql(comptime T: type, value: T) Eql(T) {
         return Eql(T).init(.{value});
     }
-    pub fn Eql(comptime T: type) type {
-        const S = struct {
-            fn atom(a: T, b: T) bool {
-                return a == b;
-            }
-        };
-        return Pipeline(T, bool, &.{
-            Atom.init(S.atom),
-        });
+
+    pub fn map(comptime Stream: type, pipe: anytype) Map(Stream, @TypeOf(pipe)) {
+        return Map(Stream, @TypeOf(pipe)).init(.{pipe});
     }
 };
+
+pub fn Eql(comptime T: type) type {
+    const S = struct {
+        fn atom(a: T, b: T) bool {
+            return a == b;
+        }
+    };
+    return Pipeline(T, bool, &.{
+        Atom.init(S.atom),
+    });
+}
+
+pub fn Map(comptime Stream: type, comptime Pipe: type) type {
+    const S = struct {
+        fn atom(p: Pipe, s: Stream) Stream.Map(Pipe) {
+            return s.map(p);
+        }
+    };
+    return Pipeline(Stream, Stream.Map(Pipe), &.{
+        Atom.init(S.atom),
+    });
+}
 
 test "Pipeline" {
     const S = struct {

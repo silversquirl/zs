@@ -17,6 +17,7 @@ pub fn Stream(
         context: Context,
 
         const Self = @This();
+        pub const Child = T;
 
         pub usingnamespace blk: {
             const fi = @typeInfo(@TypeOf(nextFn)).Fn;
@@ -84,14 +85,33 @@ fn StreamInternal(
     };
 }
 
-fn MapStream(comptime S: type, comptime P: type) type {
+pub fn NextReturnType(comptime S: type) type {
+    const ti = @typeInfo(S);
+    if (ti == .Pointer) {
+        return NextReturnType(ti.Pointer.child);
+    }
+    return @typeInfo(@TypeOf(S.next)).Fn.return_type.?;
+}
+
+pub fn MapStream(comptime S: type, comptime P: type) type {
     return struct {
         stream: S,
         pipe: P,
 
         const Self = @This();
-        fn next(self: Self) ?P.pipeline_signature.Out {
-            const v = self.stream.next() orelse return null;
+        const nti = @typeInfo(NextReturnType(S));
+        pub const Result = if (nti == .ErrorUnion)
+            nti.ErrorUnion.error_set!?P.pipeline_signature.Out
+        else
+            ?P.pipeline_signature.Out;
+
+        fn next(self: Self) Result {
+            const opt_v = if (nti == .ErrorUnion)
+                try self.stream.next()
+            else
+                self.stream.next();
+
+            const v = opt_v orelse return null;
             return self.pipe.apply(v);
         }
     };
@@ -119,16 +139,24 @@ pub fn SplitStream(comptime S: type, comptime P: type) type {
                 .child => unreachable,
             }
         }
-        fn resultNext(self: *Self) ?P.pipeline_signature.In {
+        fn resultNext(self: *Self) NextReturnType(S) {
             std.debug.assert(self.state == .child);
-            const v = self.stream.next() orelse {
+
+            const opt_v = if (@typeInfo(NextReturnType(S)) == .ErrorUnion)
+                try self.stream.next()
+            else
+                self.stream.next();
+
+            const v = opt_v orelse {
                 self.state = .done;
                 return null;
             };
+
             if (self.pipe.apply(v)) {
                 self.state = .delim;
                 return null;
             }
+
             return v;
         }
 
@@ -140,7 +168,22 @@ pub const constructors = struct {
     pub fn sliceStream(comptime T: type, slice: []const T) Stream(T, SliceIterator(T), SliceIterator(T).next) {
         return .{ .context = .{ .slice = slice } };
     }
+
+    pub fn readerStream(r: anytype) Stream(u8, @TypeOf(r), readByteOpt(@TypeOf(r))) {
+        return .{ .context = r };
+    }
 };
+
+pub fn readByteOpt(comptime Reader: type) fn (Reader) Reader.Error!?u8 {
+    return struct {
+        fn f(r: Reader) Reader.Error!?u8 {
+            return r.readByte() catch |err| switch (err) {
+                error.EndOfStream => @as(?u8, null),
+                else => |e| e,
+            };
+        }
+    }.f;
+}
 
 pub fn SliceIterator(comptime T: type) type {
     return struct {
@@ -177,6 +220,26 @@ test "sliceStream" {
     try std.testing.expectEqual(i, s.next());
 }
 
+test "readerStream" {
+    const xs = [_]u8{
+        1, 2, 3, 4, 5, 6, 7, 8, 9,
+        9, 8, 7, 6, 5, 4, 3, 2, 1,
+    };
+    var xss = std.io.fixedBufferStream(&xs);
+    var s = constructors.readerStream(xss.reader());
+
+    var i: ?u8 = 1;
+    while (i.? < 10) : (i.? += 1) {
+        try std.testing.expectEqual(i, try s.next());
+    }
+    while (i.? > 1) {
+        i.? -= 1;
+        try std.testing.expectEqual(i, try s.next());
+    }
+    i = null;
+    try std.testing.expectEqual(i, try s.next());
+}
+
 test "Stream.map" {
     const xs = [_]u32{ 0, 2, 4, 6, 8, 10 };
     var s0 = constructors.sliceStream(u32, &xs);
@@ -200,9 +263,8 @@ test "Stream.map" {
 }
 
 test "Stream.split" {
-    const xs = [_]u32{ 1, 2, 3, 0, 4, 5, 6, 0, 7, 8, 9 };
+    const xs = [_]u32{ 1, 2, 3, 0, 4, 5, 6, 0, 0, 7, 8, 9, 0 };
     var s0 = constructors.sliceStream(u32, &xs);
-
     var s1 = s0.split(pipeline.constructors.eql(u32, 0));
 
     var s = s1.next() orelse return error.TestExpectedNotNull;
@@ -218,8 +280,41 @@ test "Stream.split" {
     try std.testing.expectEqual(@as(?u32, null), s.next());
 
     s = s1.next() orelse return error.TestExpectedNotNull;
+    try std.testing.expectEqual(@as(?u32, null), s.next());
+
+    s = s1.next() orelse return error.TestExpectedNotNull;
     try std.testing.expectEqual(@as(?u32, 7), s.next());
     try std.testing.expectEqual(@as(?u32, 8), s.next());
     try std.testing.expectEqual(@as(?u32, 9), s.next());
+    try std.testing.expectEqual(@as(?u32, null), s.next());
+
+    s = s1.next() orelse return error.TestExpectedNotNull;
+    try std.testing.expectEqual(@as(?u32, null), s.next());
+
+    if (s1.next() != null) return error.TestExpectedNull;
+}
+
+test "pipeline.constructors.map" {
+    const xs = [_]u32{ 1, 0, 2 };
+    var s0 = constructors.sliceStream(u32, &xs);
+    var s1 = s0.split(pipeline.constructors.eql(u32, 0));
+
+    const S = struct {
+        fn add(a: u32, b: u32) u32 {
+            return a + b;
+        }
+    };
+    const P = pipeline.Pipeline(u32, u32, &.{
+        pipeline.Atom.init(S.add),
+    });
+
+    const s2 = s1.map(pipeline.constructors.map(@TypeOf(s1).Child, P.init(.{1})));
+
+    var s = s2.next() orelse return error.TestExpectedNotNull;
+    try std.testing.expectEqual(@as(?u32, 2), s.next());
+    try std.testing.expectEqual(@as(?u32, null), s.next());
+
+    s = s2.next() orelse return error.TestExpectedNotNull;
+    try std.testing.expectEqual(@as(?u32, 3), s.next());
     try std.testing.expectEqual(@as(?u32, null), s.next());
 }
